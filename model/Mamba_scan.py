@@ -1,3 +1,5 @@
+import torch.nn as nn
+from torch.nn.init import constant_
 import math
 import torch
 import torch.nn as nn
@@ -5,10 +7,9 @@ import torch.nn.functional as F
 from functools import partial
 from typing import Optional, Callable
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
-import torch.nn as nn
-from torch.nn.init import constant_
+
+
 try:
     from model.ops_dcnv3.functions import DCNv3Function
 except:
@@ -36,20 +37,6 @@ class to_channels_last(nn.Module):
     def forward(self, x):
         return x.permute(0, 2, 3, 1)
 
-def random_seed_setting(seed: int = 42):
-    import random
-    import os
-    import numpy as np
-    import torch
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    np.random.seed(seed)
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
 
 def build_norm_layer(dim,
                      norm_layer,
@@ -191,6 +178,7 @@ class SpatialAdaptiveScan(nn.Module):
         if self.center_feature_scale:
             center_feature_scale = self.center_feature_scale_module(
                 x1, self.center_feature_scale_proj_weight, self.center_feature_scale_proj_bias)
+            # N, H, W, groups -> N, H, W, groups, 1 -> N, H, W, groups, _d_per_group -> N, H, W, channels
             center_feature_scale = center_feature_scale[..., None].repeat(
                 1, 1, 1, 1, self.channels // self.group).flatten(-2)
             x = x * (1 - center_feature_scale) + x_proj * center_feature_scale
@@ -200,17 +188,17 @@ class SpatialAdaptiveScan(nn.Module):
 
 
 class SpectralAdaptiveScan(nn.Module):
-
     def __init__(
             self,
-            channels,  
-            kernel_size=3,  
+            channels,
+            kernel_size=3,
+            stride=1,
             pad=1,
             group=1,
-            offset_scale=0.1,
+            offset_scale=1.0,
             act_layer='GELU',
             norm_layer='LN',
-            spectral_reduction=False, 
+            spectral_reduction=False,
             reduction_ratio=2, 
     ):
         super().__init__()
@@ -223,12 +211,10 @@ class SpectralAdaptiveScan(nn.Module):
         self.offset_scale = offset_scale
         self.spectral_reduction = spectral_reduction
         self.reduction_ratio = reduction_ratio
-
         if spectral_reduction:
             self.reduced_channels = channels // reduction_ratio
         else:
             self.reduced_channels = channels
-
         self.spectral_conv = nn.Sequential(
             nn.Conv1d(
                 channels,
@@ -236,7 +222,7 @@ class SpectralAdaptiveScan(nn.Module):
                 kernel_size=kernel_size,
                 stride=1,
                 padding=pad,
-                groups=channels 
+                groups=channels
             ),
             self._build_norm_layer(channels, norm_layer),
             self._build_act_layer(act_layer)
@@ -244,14 +230,13 @@ class SpectralAdaptiveScan(nn.Module):
 
         self.offset_generator = nn.Linear(
             channels,
-            group * kernel_size 
+            group * kernel_size
         )
 
         self.weight_generator = nn.Linear(
             channels,
             group * kernel_size
         )
-
         if spectral_reduction:
             self.spectral_reduction_layer = nn.Conv1d(
                 channels,
@@ -292,7 +277,7 @@ class SpectralAdaptiveScan(nn.Module):
         constant_(self.weight_generator.bias.data, 0.)
 
     def spectral_adaptive_sample(self, x, offsets, weights):
-        if len(x.shape) == 4:  
+        if len(x.shape) == 4:
             B, C, H, W = x.shape
             x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
             offsets = offsets.view(B, H * W, -1)
@@ -302,7 +287,7 @@ class SpectralAdaptiveScan(nn.Module):
 
             sampled = sampled.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
 
-        else: 
+        else:
             sampled = self._adaptive_spectral_sample_1d(
                 x.permute(0, 2, 1), offsets, weights
             ).permute(0, 2, 1)
@@ -316,18 +301,16 @@ class SpectralAdaptiveScan(nn.Module):
 
         offsets = offsets.view(B, L, G, K)
         weights = weights.view(B, L, G, K)
-        weights = F.softmax(weights, dim=-1) 
-
+        weights = F.softmax(weights, dim=-1)
         group_size = C // G
         outputs = []
 
         for g in range(G):
             start_idx = g * group_size
             end_idx = (g + 1) * group_size if g < G - 1 else C
-            x_group = x[:, :, start_idx:end_idx] 
-
-            offset_group = offsets[:, :, g, :]  
-            weight_group = weights[:, :, g, :] 
+            x_group = x[:, :, start_idx:end_idx]
+            offset_group = offsets[:, :, g, :]
+            weight_group = weights[:, :, g, :]
 
             sampled_group = self._sample_spectral_neighbors(
                 x_group, offset_group, weight_group
@@ -343,13 +326,13 @@ class SpectralAdaptiveScan(nn.Module):
         base_indices = torch.arange(group_size, device=x.device, dtype=torch.float32)
         base_indices = base_indices.view(1, 1, 1, -1).expand(B, L, K, -1)
 
-        offsets_expanded = offsets.unsqueeze(-1) 
-        sample_indices = base_indices + offsets_expanded 
+        offsets_expanded = offsets.unsqueeze(-1)
+        sample_indices = base_indices + offsets_expanded
 
         sample_indices = torch.clamp(sample_indices, 0, group_size - 1)
         sampled_features = []
         for k in range(K):
-            indices = sample_indices[:, :, k, :] 
+            indices = sample_indices[:, :, k, :]
 
             indices_floor = torch.floor(indices).long()
             indices_ceil = torch.ceil(indices).long()
@@ -365,9 +348,9 @@ class SpectralAdaptiveScan(nn.Module):
             sampled_features.append(x_interp)
 
         sampled_features = torch.stack(sampled_features, dim=2)
-        weights_expanded = weights.unsqueeze(-1) 
+        weights_expanded = weights.unsqueeze(-1)
 
-        output = torch.sum(sampled_features * weights_expanded, dim=2)  
+        output = torch.sum(sampled_features * weights_expanded, dim=2)
 
         return output
 
@@ -411,6 +394,23 @@ class SpectralAdaptiveScan(nn.Module):
 
         return output
 
+
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+
+def random_seed_setting(seed: int = 42):
+    import random
+    import os
+    import numpy as np
+    import torch
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 class MS2D(nn.Module):
     def __init__(
@@ -575,7 +575,6 @@ class MS2D(nn.Module):
     def zigzag_scan(self, x):
         B, C, H, W = x.shape
         device = x.device
-
         indices = []
 
         k = 0
@@ -585,7 +584,6 @@ class MS2D(nn.Module):
         while i < H and j < W and k < H * W:
             indices.append(i * W + j)
             k += 1
-
             if (i + j) % 2 == 0:
                 if (i - 1) >= 0 and (j + 1) >= W:
                     i = i + 1
@@ -606,16 +604,13 @@ class MS2D(nn.Module):
                 else:
                     i = i + 1
                     j = j - 1
-
         indices_tensor = torch.tensor(indices, device=device, dtype=torch.long)
-
         x_flat = x.view(B, C, H * W)
         x_zigzag = torch.gather(x_flat, dim=2, index=indices_tensor.unsqueeze(0).unsqueeze(0).expand(B, C, -1))
 
         return x_zigzag
 
     def forward_core(self, x: torch.Tensor):
-
         y = self.zigzag_scan(x)
 
         return y
@@ -627,7 +622,7 @@ class MS2D(nn.Module):
         xz = self.in_proj(x)
         x, z = xz.chunk(2, dim=-1)
 
-        x = x.permute(0, 3, 1, 2).contiguous() 
+        x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
 
         x = self.da_scan(input_, x.permute(0, 2, 3, 1).contiguous())
@@ -680,7 +675,7 @@ class Fuse_SS2D(nn.Module):
             nn.Linear(self.d_inner1, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner1, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
         )
-        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
+        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))
         del self.x_proj
 
         self.dt_projs = (
@@ -693,13 +688,15 @@ class Fuse_SS2D(nn.Module):
             self.dt_init(self.dt_rank, self.d_inner2, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
                          **factory_kwargs),
         )
-        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  
-        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0)) 
+        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))
+        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))
         del self.dt_projs
 
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner2, copies=4, merge=True) 
-        self.Ds = self.D_init(self.d_inner2, copies=4, merge=True)  
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner2, copies=4, merge=True)
+        self.Ds = self.D_init(self.d_inner2, copies=4, merge=True)
+
         self.selective_scan = selective_scan_fn
+
         self.out_norm = nn.LayerNorm(self.d_inner2)
 
     @staticmethod
@@ -749,7 +746,7 @@ class Fuse_SS2D(nn.Module):
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D) 
+        D = nn.Parameter(D)
         D._no_weight_decay = True
         return D
 
@@ -759,22 +756,22 @@ class Fuse_SS2D(nn.Module):
         K = 4
         x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)],
                              dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) 
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
         xs = xs.float().view(B, -1, L)
-        dts = dts.contiguous().float().view(B, -1, L)  
+        dts = dts.contiguous().float().view(B, -1, L)
         Bs = Bs.float().view(B, K, -1, L)
-        Cs = Cs.float().view(B, K, -1, L) 
+        Cs = Cs.float().view(B, K, -1, L)
         Ds = self.Ds.float().view(-1)
         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
         dt_projs_bias = self.dt_projs_bias.float().view(-1)
 
         y_hwwh = torch.stack([y.view(B, -1, L), torch.transpose(y, dim0=2, dim1=3).contiguous().view(B, -1, L)],
                              dim=1).view(B, 2, -1, L)
-        ys = torch.cat([y_hwwh, torch.flip(y_hwwh, dims=[-1])], dim=1) 
+        ys = torch.cat([y_hwwh, torch.flip(y_hwwh, dims=[-1])], dim=1)
         ys = ys.float().view(B, -1, L)
 
         out_y = self.selective_scan(
@@ -973,7 +970,7 @@ class Spec_SS1D(nn.Module):
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
             nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
         )
-        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
+        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))
         del self.x_proj
 
         self.dt_projs = (
@@ -982,12 +979,12 @@ class Spec_SS1D(nn.Module):
             self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
                          **factory_kwargs),
         )
-        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K=4, inner, rank)
-        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
+        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))
+        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))
         del self.dt_projs
 
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=2, merge=True)  # (K=2, D, N)
-        self.Ds = self.D_init(self.d_inner, copies=2, merge=True)  # (K=2, D, N)
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=2, merge=True)
+        self.Ds = self.D_init(self.d_inner, copies=2, merge=True)
 
         self.selective_scan = selective_scan_fn
 
@@ -1044,7 +1041,7 @@ class Spec_SS1D(nn.Module):
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D) 
+        D = nn.Parameter(D)
         D._no_weight_decay = True
         return D
 
@@ -1058,12 +1055,12 @@ class Spec_SS1D(nn.Module):
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
         xs = xs.float().view(B, -1, L)
-        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
+        dts = dts.contiguous().float().view(B, -1, L)
         Bs = Bs.float().view(B, K, -1, L)
-        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
+        Cs = Cs.float().view(B, K, -1, L)
         Ds = self.Ds.float().view(-1)
         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
-        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1)
         out_y = self.selective_scan(
             xs, dts,
             As, Bs, Cs, Ds, z=None,
@@ -1140,7 +1137,7 @@ class SpectralAdaptive_SS1D(nn.Module):
             bias=False,
             device=None,
             dtype=None,
-            spectral_adaptive=True, 
+            spectral_adaptive=True,
             **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -1185,7 +1182,7 @@ class SpectralAdaptive_SS1D(nn.Module):
         if self.spectral_adaptive:
             self.spectral_scan = SpectralAdaptiveScan(
                 channels=self.d_inner,
-                group=4,  
+                group=4,
                 **kwargs
             )
 
@@ -1274,15 +1271,14 @@ class SpectralAdaptive_SS1D(nn.Module):
         x_inner, z = xz.chunk(2, dim=-1)
 
         x_inner = self.act(self.proj(x_inner))
-
         if self.spectral_adaptive:
-            if len(x_inner.shape) == 3:  # [B, L, D]
-                x_inner = x_inner.permute(0, 2, 1)  # [B, D, L]
+            if len(x_inner.shape) == 3:
+                x_inner = x_inner.permute(0, 2, 1)
 
             x_inner = self.spectral_scan(x_inner, x_inner)
 
-            if len(x_inner.shape) == 3:  # [B, D, L]
-                x_inner = x_inner.permute(0, 2, 1)  # [B, L, D]
+            if len(x_inner.shape) == 3:
+                x_inner = x_inner.permute(0, 2, 1)
 
         y1, y2 = self.forward_core(x_inner)
         assert y1.dtype == torch.float32
@@ -1306,7 +1302,7 @@ class SimpleSpecMambaBlock(nn.Module):
             d_state: int = 16,
             expand: float = 0.5,
             spectral_adaptive: bool = True,
-            dropout: float = 0., 
+            dropout: float = 0.,
             **kwargs,
     ):
         super().__init__()
@@ -1317,7 +1313,7 @@ class SimpleSpecMambaBlock(nn.Module):
             d_model=hidden_dim,
             d_state=d_state,
             expand=expand,
-            dropout=dropout,
+            dropout=dropout, 
             spectral_adaptive=spectral_adaptive,
             **clean_kwargs
         )
@@ -1326,15 +1322,15 @@ class SimpleSpecMambaBlock(nn.Module):
     def forward(self, input):
         original_shape = input.shape
 
-        if len(input.shape) == 5: 
+        if len(input.shape) == 5:
             B, C, N, H, W = input.size()
             input = input.reshape(B, C * N, H * W)
-            input = input.permute(0, 2, 1)  
+            input = input.permute(0, 2, 1)
             target_shape = (B, C, N, H, W)
-        elif len(input.shape) == 4: 
+        elif len(input.shape) == 4:
             B, C, H, W = input.shape
             input = input.reshape(B, C, H * W)
-            input = input.permute(0, 2, 1)  
+            input = input.permute(0, 2, 1)
             target_shape = (B, C, H, W)
         else:
             target_shape = original_shape
