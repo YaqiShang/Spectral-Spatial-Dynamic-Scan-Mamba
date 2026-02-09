@@ -51,3 +51,7 @@ python main.py --model SDSM \
 - `--batch_size`: Batch size for training
 - `--dataset`: Dataset name (Augsburg, Italy, MUUFL, etc.)
 - `--cuda`: GPU device ID
+
+## 💌 Acknowledgments
+
+This project is largely based on [Mamba](https://github.com/state-spaces/mamba),[VMamba](https://github.com/MzeroMiko/VMamba) and [DAMamba](https://github.com/ltzovo/DAMamba). We are truly grateful for their excellent work.
