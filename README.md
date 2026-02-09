@@ -8,7 +8,7 @@
 
 
 ### 📋 Requirements
-
+>
 - CUDA 12.1
 - Python 3.9.19
 - PyTorch 2.0.1
