@@ -14,3 +14,40 @@
 > - Torchvision 0.15.2
 > - causal_conv1d==1.4.0
 > - mamba_ssm==2.2.2
+
+## 🚀 Usage
+
+### Dataset Preparation
+
+Organize your dataset as follows:
+```
+dataset/
+  └── Augsburg/
+      ├── TrainImage.mat  # Training set
+      └── TestImage.mat  # Test set
+```
+
+### Training
+```bash
+python main.py --model SDSM \
+               --flip_augmentation \
+               --patch_size 7 \
+               --epoch 400 \
+               --lr 0.0001 \
+               --batch_size 64 \
+               --seed 0 \
+               --dataset Augsburg \
+               --folder './dataset/' \
+               --train_set './dataset/Augsburg/TrainImage.mat' \
+               --test_set './dataset/Augsburg/TestImage.mat' \
+               --cuda 0
+```
+
+### Key Parameters
+
+- `--model`: Model architecture (default: SDSM)
+- `--epoch`: Number of training epochs
+- `--lr`: Learning rate
+- `--batch_size`: Batch size for training
+- `--dataset`: Dataset name (Augsburg, Italy, MUUFL, etc.)
+- `--cuda`: GPU device ID
