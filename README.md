@@ -54,6 +54,6 @@ python main.py --model SDSM \
 - `--dataset`: Dataset name (Augsburg, Italy, MUUFL, etc.)
 - `--cuda`: GPU device ID
 
-## 💌 Acknowledgments
+### 💌 Acknowledgments
 
 This project is largely based on [Mamba](https://github.com/state-spaces/mamba), [VMamba](https://github.com/MzeroMiko/VMamba), [MSFMamba](https://github.com/oucailab/MSFMamba)and [DAMamba](https://github.com/ltzovo/DAMamba). We are truly grateful for their excellent work.
